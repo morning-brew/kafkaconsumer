@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
-
-	"github.com/segmentio/kafka-go"
 )
 
 const DefaultBufSize = 100
@@ -20,7 +18,7 @@ type ErrorFunc func(error)
 
 type Consumer[T any] struct {
 	ctx            context.Context
-	reader         *kafka.Reader
+	reader         MessageReader
 	MessageChannel chan T
 	strict         bool
 	wg             sync.WaitGroup
@@ -29,9 +27,10 @@ type Consumer[T any] struct {
 	stoppedLock    sync.RWMutex
 	onError        ErrorFunc
 	parseMessage   func([]byte) T
+	handleMessage  func(T) error
 }
 
-func NewConsumer[T any](ctx context.Context, config Config, bufSize int64, strict bool, parseMessageFunc func([]byte) T, onError ErrorFunc) *Consumer[T] {
+func NewConsumer[T any](ctx context.Context, reader MessageReader, bufSize int64, strict bool, parseMessageFunc func([]byte) T, onError ErrorFunc, handleMessage func(T) error) *Consumer[T] {
 	if bufSize < 0 {
 		bufSize = DefaultBufSize
 	}
@@ -46,7 +45,7 @@ func NewConsumer[T any](ctx context.Context, config Config, bufSize int64, stric
 		}
 	}
 	return &Consumer[T]{
-		reader:         config.Build(),
+		reader:         reader,
 		MessageChannel: make(chan T, bufSize),
 		strict:         strict,
 		wg:             sync.WaitGroup{},
@@ -54,34 +53,50 @@ func NewConsumer[T any](ctx context.Context, config Config, bufSize int64, stric
 		stoppedLock:    sync.RWMutex{},
 		onError:        onError,
 		parseMessage:   parseMessageFunc,
+		handleMessage:  handleMessage,
 	}
 }
 
 func (c *Consumer[T]) Start() {
+	// start the consumer in a go func
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 		c.consume(c.ctx)
 	}()
+	// if we are handling the messages, start this in a go func as well
+	if c.handleMessage != nil {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			c.pollMessages()
+		}()
+	}
 }
 
 func (c *Consumer[T]) consume(ctx context.Context) error {
 	for {
+		// check to see if the channel is closed
 		c.stoppedLock.RLock()
 		if c.stopped {
 			return ErrChannelClosed
 		}
 		c.stoppedLock.RUnlock()
-		m, err := c.reader.ReadMessage(ctx)
+
+		dataBytes, err := c.reader.ReadMessage(ctx)
 		if err != nil {
 			c.onError(err)
 			continue
 		}
-		msg := c.parseMessage(m.Value)
+		msg := c.parseMessage(dataBytes)
+
+		// if in strict mode, block until the channel is open
 		if c.strict {
 			c.MessageChannel <- msg
 			continue
 		}
+
+		// otherwise drop messages that we can't consume fast enough
 		select {
 		case c.MessageChannel <- msg:
 			continue
@@ -89,7 +104,15 @@ func (c *Consumer[T]) consume(ctx context.Context) error {
 			c.onError(ErrChannelFull)
 		}
 	}
+}
 
+func (c *Consumer[T]) pollMessages() {
+	for msg := range c.MessageChannel {
+		err := c.handleMessage(msg)
+		if err != nil {
+			c.onError(err)
+		}
+	}
 }
 
 func (c *Consumer[T]) Close() {
@@ -99,6 +122,6 @@ func (c *Consumer[T]) Close() {
 		close(c.MessageChannel)
 		c.stoppedLock.Unlock()
 	})
-
+	// wait for the channel to drain before finishing
 	c.wg.Wait()
 }

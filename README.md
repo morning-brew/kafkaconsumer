@@ -46,6 +46,7 @@ Next create and start your consumer
 				handleMessage,
 			)
 	consumer.Start()
+    defer consumer.Close()
 ```
 
 The consumer takes the following arguments

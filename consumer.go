@@ -79,6 +79,7 @@ func (c *Consumer[T]) consume(ctx context.Context) error {
 		// check to see if the channel is closed
 		c.stoppedLock.RLock()
 		if c.stopped {
+			c.close()
 			return ErrChannelClosed
 		}
 		c.stoppedLock.RUnlock()
@@ -116,12 +117,15 @@ func (c *Consumer[T]) pollMessages() {
 }
 
 func (c *Consumer[T]) Close() {
-	c.once.Do(func() {
-		c.stoppedLock.Lock()
-		c.stopped = true
-		close(c.MessageChannel)
-		c.stoppedLock.Unlock()
-	})
+	c.stoppedLock.Lock()
+	c.stopped = true
+	c.stoppedLock.Unlock()
 	// wait for the channel to drain before finishing
 	c.wg.Wait()
+}
+
+func (c *Consumer[T]) close() {
+	c.once.Do(func() {
+		close(c.MessageChannel)
+	})
 }
